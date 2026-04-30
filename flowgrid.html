@@ -266,6 +266,7 @@ body {
 <div class="overlay" id="lb-overlay" style="display:none">
   <div class="modal">
     <h2>🏆 Leaderboard</h2>
+    <div id="lb-status" style="font-size:11px;color:#888;text-align:center;min-height:16px;margin-bottom:4px"></div>
     <table id="lb-tbl">
       <thead><tr><th>#</th><th>Name</th><th>Score</th><th>Lvl</th></tr></thead>
       <tbody id="lb-body"></tbody>
@@ -308,6 +309,8 @@ const WIN_DATA = [
 ];
 
 const GAP = 3; // board cell gap px
+
+const FB_URL = 'https://flowgrid-c3bc0-default-rtdb.europe-west1.firebasedatabase.app/leaderboard';
 
 /* ═══════════════════════════════════════════════
    SEEDED RNG  (mulberry32)
@@ -472,6 +475,7 @@ let S = {         // persistent across levels
   level: 1,
   score: 0,
   seed: 0,
+  uid: crypto.randomUUID(),
 };
 
 let P = null;     // current puzzle
@@ -708,7 +712,7 @@ function showWin() {
   const earned = base + tb + eb;
   S.score += earned;
 
-  updateLB(S.name, S.score, S.level);
+  updateLB(S.name, S.score, S.level).catch(() => {});
   saveProgress();
 
   const [emoji, phrase] = WIN_DATA[Math.floor(Math.random() * WIN_DATA.length)];
@@ -877,41 +881,93 @@ document.getElementById('trophy-btn').onclick = () => showLB();
 document.getElementById('lb-close').onclick = () => { document.getElementById('lb-overlay').style.display='none'; };
 
 /* ═══════════════════════════════════════════════
-   LEADERBOARD
+   LEADERBOARD  (Firebase REST + localStorage fallback)
 ═══════════════════════════════════════════════ */
-function loadLB() {
+function nameKey(name) {
+  return name.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 30) || 'player';
+}
+function saveLBCache(lb) {
+  try { localStorage.setItem('fg_lb', JSON.stringify(lb)); } catch {}
+}
+function loadLBCache() {
   try { return JSON.parse(localStorage.getItem('fg_lb') || '[]'); } catch { return []; }
 }
-function saveLB(lb) { localStorage.setItem('fg_lb', JSON.stringify(lb)); }
-
-function updateLB(name, score, level) {
-  let lb = loadLB();
-  const i = lb.findIndex(e => e.name === name);
-  if (i !== -1) {
-    lb[i].score = Math.max(lb[i].score, score);
-    lb[i].level = Math.max(lb[i].level, level);
-  } else {
-    lb.push({ name, score, level });
+async function loadLB() {
+  if (!FB_URL) return loadLBCache();
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(`${FB_URL}.json`, { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    if (!data) return [];
+    const lb = Object.values(data)
+      .filter(e => e && typeof e.name === 'string' && typeof e.score === 'number')
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10);
+    saveLBCache(lb);
+    return lb;
+  } catch {
+    return loadLBCache();
   }
-  lb.sort((a,b)=>b.score-a.score);
-  saveLB(lb.slice(0,10));
 }
-
-function showLB() {
-  const lb = loadLB();
+async function updateLB(name, score, level) {
+  if (!FB_URL) {
+    let lb = loadLBCache();
+    const i = lb.findIndex(e => e.name === name);
+    if (i !== -1) {
+      if (score <= lb[i].score) return;
+      lb[i].score = score; lb[i].level = level;
+    } else {
+      lb.push({ name, score, level });
+    }
+    lb.sort((a, b) => b.score - a.score);
+    saveLBCache(lb.slice(0, 10));
+    return;
+  }
+  const key = S.uid;
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(`${FB_URL}/${key}.json`, { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (res.ok) {
+      const existing = await res.json();
+      if (existing && existing.score >= score) return;
+    }
+    await fetch(`${FB_URL}/${key}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, score, level, uid: key })
+    });
+  } catch {
+    let lb = loadLBCache();
+    const i = lb.findIndex(e => e.name === name);
+    if (i !== -1) { lb[i].score = Math.max(lb[i].score, score); lb[i].level = Math.max(lb[i].level, level); }
+    else lb.push({ name, score, level });
+    lb.sort((a, b) => b.score - a.score);
+    saveLBCache(lb.slice(0, 10));
+  }
+}
+async function showLB() {
   const tbody = document.getElementById('lb-body');
+  const status = document.getElementById('lb-status');
+  document.getElementById('lb-overlay').style.display = 'flex';
   tbody.innerHTML = '';
+  if (status) status.textContent = 'Loading...';
+  const lb = await loadLB();
+  if (status) status.textContent = !FB_URL ? '(offline)' : '';
   if (!lb.length) {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:14px;color:#555">No scores yet</td></tr>';
   } else {
-    lb.forEach((e,i) => {
+    lb.forEach((e, i) => {
       const tr = document.createElement('tr');
       if (i < 3) tr.className = `rank-${i+1}`;
       tr.innerHTML = `<td>${i+1}</td><td>${esc(e.name)}</td><td>${e.score}</td><td>${e.level}</td>`;
       tbody.appendChild(tr);
     });
   }
-  document.getElementById('lb-overlay').style.display = 'flex';
 }
 
 function esc(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -920,7 +976,7 @@ function esc(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
    PERSISTENCE
 ═══════════════════════════════════════════════ */
 function saveProgress() {
-  localStorage.setItem('fg_save', JSON.stringify({ name:S.name, level:S.level, score:S.score, seed:S.seed }));
+  localStorage.setItem('fg_save', JSON.stringify({ name:S.name, level:S.level, score:S.score, seed:S.seed, uid:S.uid }));
 }
 function loadSave() {
   try { return JSON.parse(localStorage.getItem('fg_save') || 'null'); } catch { return null; }
@@ -1000,6 +1056,7 @@ function init() {
     S.level = saved.level || 1;
     S.score = saved.score || 0;
     S.seed  = saved.seed  || (Math.random()*0xFFFFFFFF)|0;
+    if (saved.uid) S.uid = saved.uid;
     document.getElementById('name-modal').style.display = 'none';
     startLevel();
     if (S.level > 1) toast(`↩ Continuing from level ${S.level}`);
